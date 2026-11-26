@@ -1567,22 +1567,31 @@ impl Staking {
     /// on an address that's already indexed, has nothing staked, or doesn't
     /// exist at all is a harmless no-op, so it can never brick or
     /// double-register anyone, and it never claws back or reassigns any
-    /// reward already accrued or paid.
+    /// reward already accrued or paid. A versioned event reports the number
+    /// of newly indexed stakers in each call.
     pub fn register_existing_stakers(env: Env, stakers: Vec<Address>) -> Result<(), StakingError> {
         Self::extend_instance_ttl(&env);
         if stakers.len() > MAX_BATCH_SIZE {
             return Err(StakingError::BatchTooLarge);
         }
+        let mut added = 0u32;
         for staker in stakers.iter() {
             let raw: i128 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::StakerAmount(staker.clone()))
                 .unwrap_or(0);
-            if raw > 0 {
+            let slot_key = DataKey::StakerSlot(staker.clone());
+            if raw > 0 && !env.storage().persistent().has(&slot_key) {
+                added += 1;
                 Self::_index_add(&env, &staker);
             }
         }
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "staker_index_backfilled"),),
+            (added,)
+        );
         Ok(())
     }
 
@@ -1603,6 +1612,8 @@ impl Staking {
     /// running go straight to or out of the new registry; an entry whose
     /// balance is already zero is skipped. Returns the number of legacy entries
     /// not yet processed (0 once finished or when there is nothing to migrate).
+    /// A versioned progress event reports `(offset, processed, remaining)` on
+    /// every successful call.
     pub fn migrate_staker_index(env: Env, offset: u32, limit: u32) -> Result<u32, StakingError> {
         Self::extend_instance_ttl(&env);
         if limit == 0 || limit > MAX_BATCH_SIZE {
@@ -1611,7 +1622,14 @@ impl Staking {
         let legacy: Option<Vec<Address>> = env.storage().instance().get(&DataKey::StakerIndex);
         let legacy = match legacy {
             Some(legacy) => legacy,
-            None => return Ok(0),
+            None => {
+                soroban_amm_sdk::emit_versioned_event!(
+                    env,
+                    (Symbol::new(&env, "staker_index_migration_progress"),),
+                    (0u32, 0u32, 0u32)
+                );
+                return Ok(0);
+            }
         };
         let cursor: u32 = env
             .storage()
@@ -1624,6 +1642,8 @@ impl Staking {
 
         let len = legacy.len();
         let end = offset.saturating_add(limit).min(len);
+        let processed = end.saturating_sub(offset);
+        let remaining = len - end;
         let mut i = offset;
         while i < end {
             let staker = legacy.get(i).unwrap();
@@ -1638,6 +1658,12 @@ impl Staking {
             i += 1;
         }
 
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "staker_index_migration_progress"),),
+            (offset, processed, remaining)
+        );
+
         if end >= len {
             env.storage().instance().remove(&DataKey::StakerIndex);
             env.storage().instance().remove(&DataKey::MigrationCursor);
@@ -1651,7 +1677,7 @@ impl Staking {
         env.storage()
             .instance()
             .set(&DataKey::MigrationCursor, &end);
-        Ok(len - end)
+        Ok(remaining)
     }
 
     /// Repair legacy reward accounting on an already-deployed contract (admin
@@ -4500,7 +4526,7 @@ mod tests {
     extern crate std;
     use std::vec::Vec as StdVec;
 
-    fn find_event(env: &Env, name: &str) -> Option<soroban_sdk::Val> {
+    fn find_events(env: &Env, name: &str) -> StdVec<soroban_sdk::Val> {
         use soroban_sdk::{testutils::Events as _, TryFromVal};
         // Compare decoded symbols, not raw `Val` payloads: a symbol longer than
         // nine characters is an object handle, so two equal long symbols have
@@ -4509,7 +4535,7 @@ mod tests {
         env.events()
             .all()
             .iter()
-            .find(|event| {
+            .filter(|event| {
                 event
                     .1
                     .get(0)
@@ -4518,6 +4544,11 @@ mod tests {
                     .unwrap_or(false)
             })
             .map(|event| event.2)
+            .collect()
+    }
+
+    fn find_event(env: &Env, name: &str) -> Option<soroban_sdk::Val> {
+        find_events(env, name).into_iter().next()
     }
 
     fn fresh_staker(env: &Env, lp: &Address, amount: i128) -> Address {
@@ -5568,6 +5599,19 @@ mod tests {
         let (version, (registered,)) = <(u32, (u32,))>::try_from_val(&env, &data).unwrap();
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(registered, 118);
+
+        let progress = find_events(&env, "staker_index_migration_progress");
+        assert_eq!(progress.len(), 3);
+        let decoded: StdVec<(u32, u32, u32)> = progress
+            .iter()
+            .map(|data| {
+                let (version, payload) =
+                    <(u32, (u32, u32, u32))>::try_from_val(&env, data).unwrap();
+                assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+                payload
+            })
+            .collect();
+        assert_eq!(decoded, [(0, 50, 70), (50, 50, 20), (100, 20, 0)]);
     }
 
     #[test]
@@ -5581,6 +5625,19 @@ mod tests {
         assert_eq!(staking.migrate_staker_index(&0, &50), 0);
         assert_eq!(staking.migrate_staker_index(&40, &50), 0);
         assert_registry_is(&env, &staking, &[a]);
+
+        let progress = find_events(&env, "staker_index_migration_progress");
+        assert_eq!(progress.len(), 2);
+        let payloads: StdVec<(u32, u32, u32)> = progress
+            .iter()
+            .map(|data| {
+                let (version, payload) =
+                    <(u32, (u32, u32, u32))>::try_from_val(&env, data).unwrap();
+                assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+                payload
+            })
+            .collect();
+        assert_eq!(payloads, [(0, 0, 0), (0, 0, 0)]);
     }
 
     #[test]
@@ -5734,5 +5791,17 @@ mod tests {
         staking.register_existing_stakers(&batch);
 
         assert_registry_is(&env, &staking, &[a, pre_upgrade]);
+
+        let backfilled = find_events(&env, "staker_index_backfilled");
+        assert_eq!(backfilled.len(), 2);
+        let counts: StdVec<u32> = backfilled
+            .iter()
+            .map(|data| {
+                let (version, (added,)) = <(u32, (u32,))>::try_from_val(&env, data).unwrap();
+                assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+                added
+            })
+            .collect();
+        assert_eq!(counts, [1, 0]);
     }
 }
